@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SUMMARY — Real-Time Media Streaming over a Hostile UDP Relay</title>
+<style>
+  :root {
+    --ink: #1b1f24;
+    --sub: #5b6470;
+    --line: #e2e5ea;
+    --accent: #2563eb;
+    --accent-soft: #eef2ff;
+    --ok: #0f9d58;
+    --bad: #d93025;
+    --code-bg: #f6f7f9;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 0 0 4rem 0;
+    background: #fff;
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  header {
+    padding: 3rem 2rem 2rem;
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, var(--accent-soft), #fff);
+  }
+  header h1 {
+    margin: 0 0 0.4rem;
+    font-size: 1.9rem;
+    letter-spacing: -0.02em;
+  }
+  header p.tagline {
+    margin: 0;
+    color: var(--sub);
+    font-size: 1.05rem;
+  }
+  main {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 0 2rem;
+  }
+  section {
+    margin-top: 2.6rem;
+  }
+  h2 {
+    font-size: 1.25rem;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 0.4rem;
+    margin-bottom: 1rem;
+    letter-spacing: -0.01em;
+  }
+  h3 {
+    font-size: 1.02rem;
+    margin: 1.4rem 0 0.5rem;
+  }
+  p { color: #2a2f36; }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.87rem;
+  }
+  code {
+    background: var(--code-bg);
+    padding: 0.1rem 0.35rem;
+    border-radius: 4px;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.92rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.55rem 0.7rem;
+    border-bottom: 1px solid var(--line);
+  }
+  th { color: var(--sub); font-weight: 600; }
+  .tag {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+  }
+  .tag.ok { background: #e6f4ea; color: var(--ok); }
+  .tag.bad { background: #fce8e6; color: var(--bad); }
+  .grid2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.2rem;
+    margin-top: 1rem;
+  }
+  .card {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+    background: #fafbfc;
+  }
+  .card h4 {
+    margin: 0 0 0.4rem;
+    font-size: 0.95rem;
+  }
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    padding: 0.9rem 1.1rem;
+    border-radius: 0 8px 8px 0;
+    margin: 1rem 0;
+  }
+  .callout.warn {
+    border-left-color: var(--bad);
+    background: #fdeceb;
+  }
+  ol, ul { padding-left: 1.3rem; }
+  li { margin-bottom: 0.35rem; }
+  footer {
+    max-width: 880px;
+    margin: 3rem auto 0;
+    padding: 1.2rem 2rem 0;
+    border-top: 1px solid var(--line);
+    color: var(--sub);
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Real-Time Media Streaming over a Hostile UDP Relay</h1>
+  <p class="tagline">Final architecture summary — group-XOR FEC + bounded NACK retransmit</p>
+</header>
+
+<main>
+
+<section>
+  <h2>1. Problem shape</h2>
+  <p>
+    A harness <code>source</code> hands our sender one 160-byte frame every 20ms.
+    The frame has to reach a harness <code>player</code> before a hard per-frame
+    deadline (<code>t0 + delay_ms + i&nbsp;&times;&nbsp;20ms</code>) over a link
+    that a hostile <code>relay.py</code> subjects to independently-seeded loss,
+    delay, duplication, jitter spikes, and Gilbert-Elliott burst loss on both the
+    forward (sender&rarr;receiver) and feedback (receiver&rarr;sender) legs. A run
+    is scored <strong>VALID</strong> only if the deadline-miss rate is
+    &le;1.0% <em>and</em> bandwidth overhead is &le;2.0&times; raw payload
+    bytes; among valid runs, the lowest <code>delay_ms</code> wins.
+  </p>
+  <p>
+    The core tension: every millisecond of playout delay is score we're giving
+    away, but it's also the only budget available to recover a lost packet
+    before its deadline. The design goal is to recover as much loss as
+    possible <em>without</em> spending round trips, and to spend round trips
+    only when unavoidable.
+  </p>
+</section>
+
+<section>
+  <h2>2. Architecture at a glance</h2>
+  <div class="grid2">
+    <div class="card">
+      <h4>Sender (sender.c)</h4>
+      <ul>
+        <li>Forwards every frame as <code>DATA</code> the instant it arrives — zero added delay.</li>
+        <li>Groups frames in fixed groups of 4; after the 4th, emits one <code>PARITY</code> packet (XOR of the group).</li>
+        <li>Keeps a small ring-buffer history so it can answer NACKs with a <code>RETX</code> of the exact bytes.</li>
+        <li>A dedicated feedback thread services NACKs concurrently with the main forwarding loop.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Receiver (receiver.c)</h4>
+      <ul>
+        <li>Forwards <code>DATA</code>/<code>RETX</code> to the player on first arrival (dup-safe: harness itself ignores repeats).</li>
+        <li>On a group's <code>PARITY</code> arrival, if exactly one member is still missing, XORs it back and forwards it — no round trip.</li>
+        <li>For anything FEC can't fix, sends a paced, bounded, deadline-aware NACK back through the relay.</li>
+        <li>Runs an event loop (<code>select</code>, 5ms tick) so gap-scanning and packet handling interleave without extra threads.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>3. Wire format</h2>
+  <p>Sender&rarr;relay&rarr;receiver and receiver&rarr;relay&rarr;sender both use a small fixed header (this is our own design — the harness doesn't dictate it, only the two harness-facing legs are fixed):</p>
+  <pre>uint32_t seq          (network byte order)
+uint8_t  type          0 = DATA, 1 = PARITY, 2 = RETX
+uint8_t  group_size     used only by PARITY
+[160 bytes payload]     frame bytes for DATA/RETX; XOR-of-group for PARITY</pre>
+  <p>Feedback (receiver&rarr;sender) is a 4-byte NACK: just the missing <code>seq</code>, network byte order.</p>
+</section>
+
+<section>
+  <h2>4. Loss-recovery layering</h2>
+  <ol>
+    <li>
+      <strong>FEC (free, no round trip).</strong> One parity packet per group of 4
+      (+25% bandwidth) lets the receiver reconstruct exactly one lost member of
+      that group as soon as parity plus the other three arrive, in any order.
+      This covers the overwhelming majority of isolated, uncorrelated losses
+      at zero latency cost.
+    </li>
+    <li>
+      <strong>NACK/RETX (costs one round trip, used sparingly).</strong> When a
+      group has 2+ losses, or the parity packet itself is lost, FEC can't help.
+      The receiver tracks per-frame "first seen" time and scans a lookback
+      window every 5ms; a frame that's still missing after a short initial
+      grace period (10ms, to let FEC/reordering resolve it first) gets NACKed,
+      retried up to 4 times at 30ms spacing, and given up on once the deadline
+      is within 15ms — there's no point spending bandwidth on a retransmit
+      that can no longer land in time.
+    </li>
+  </ol>
+  <div class="callout">
+    This two-tier design means bandwidth is spent proportionally to how hard
+    the loss is to fix: near-zero-cost FEC absorbs the common case, and the
+    NACK path — the only mechanism that costs a round trip — is reserved for
+    the genuinely hard cases, and abandoned early rather than wasted once it
+    can't possibly help.
+  </div>
+</section>
+
+<section>
+  <h2>5. Measured results</h2>
+  <p>
+    Full experiment-by-experiment data with all seeds and delay sweeps is in
+    <code>RUNLOG.md</code>. Headline numbers (using self-authored test
+    profiles standing in for the real grading profiles, which weren't
+    provided to this harness — see <code>RUNLOG.md</code> for the profile
+    definitions):
+  </p>
+  <table>
+    <thead>
+      <tr><th>Profile</th><th>Character</th><th>delay_ms</th><th>Miss %</th><th>Overhead</th><th>Result</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>A</td><td>Steady 3% loss, no bursts</td><td>90</td><td>0.2–0.6%</td><td>1.30&times;</td><td><span class="tag ok">VALID (all seeds)</span></td></tr>
+      <tr><td>B</td><td>Bursty/correlated loss + jitter spikes</td><td>150–400</td><td>0.7–1.7% (floor)</td><td>1.34&times;</td><td><span class="tag bad">Inconsistent</span></td></tr>
+    </tbody>
+  </table>
+  <p>
+    Bandwidth overhead is essentially flat across all runs at ~1.30–1.34&times;
+    (the +25% FEC tax plus a small NACK/RETX tail) — nowhere close to the
+    2.0&times; cap, confirming that <strong>playout delay, not bandwidth, is
+    the binding constraint</strong> for this design.
+  </p>
+</section>
+
+<section>
+  <h2>6. Known limitation: correlated burst loss</h2>
+  <div class="callout warn">
+    <strong>Increasing <code>delay_ms</code> does not fix Profile B.</strong>
+    Across a 150ms&ndash;400ms sweep the miss rate floors at roughly 1&ndash;1.7%
+    and stops improving — the harness cap is missed by a similar margin at
+    150ms and at 400ms. This is a structural gap, not an under-tuned delay.
+  </div>
+  <p>
+    The reason: NACKs and their RETX responses travel over the <em>same</em>
+    lossy relay legs as the original data. A Gilbert-Elliott burst long or
+    severe enough to take out a group's data <em>and</em> its parity can also
+    take out the NACK that would have asked for a retransmit, or the RETX
+    itself — and our retry budget (4 tries, 30ms apart) is itself a fixed
+    number of chances against a channel that, during a burst, may fail most
+    of them. No amount of extra deadline slack changes the probability that a
+    given retransmission attempt survives the same burst that caused the
+    original loss.
+  </p>
+  <p>
+    Mitigations that were considered but not implemented (out of scope for
+    this pass): interleaving frames across FEC groups so a single burst
+    can't correlate-hit both a frame and its own group's parity; a second,
+    orthogonal parity dimension (e.g. a diagonal/interleaved parity in
+    addition to the sequential group parity) to survive 2 losses per group
+    instead of 1; or sending parity redundantly (small, since it's already
+    cheap) so its own loss is less likely to coincide with a data loss in
+    the same group.
+  </p>
+</section>
+
+<section>
+  <h2>7. Reproducing these results</h2>
+  <pre>make
+python3 run.py --profile profiles/A.json --seed 1 --delay_ms 90  --duration 30
+python3 run.py --profile profiles/B.json --seed 1 --delay_ms 200 --duration 30</pre>
+  <p>
+    <code>profiles/A.json</code> and <code>profiles/B.json</code> in this
+    submission are local stand-ins (see <code>RUNLOG.md</code> for their exact
+    contents) — swap in the real grading profiles and re-run the same sweep
+    methodology (short-duration scan to find the region of interest, then
+    full-duration/multi-seed confirmation) before trusting a specific
+    <code>delay_ms</code> number against the actual grader.
+  </p>
+</section>
+
+</main>
+
+<footer>
+  Generated with AI coding assistant support, as permitted by the assignment
+  rules, from the actual measured output of <code>run.py</code>/<code>score.py</code>
+  against the sender/receiver implementation in this submission. See
+  <code>RUNLOG.md</code> for the full per-run data this summary is drawn from.
+</footer>
+
+</body>
+</html>
